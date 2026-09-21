@@ -1,0 +1,23 @@
+[
+  {
+    "time": "2026-XX-XXT00:00:00",
+    "lat": 12.5,
+    "lon": 80.5,
+    "wind_kmh": 100,
+    "pressure_hpa": 990
+  },
+  {
+    "time": "2026-XX-XXT06:00:00",
+    "lat": 12.3,
+    "lon": 80.3,
+    "wind_kmh": 115,
+    "pressure_hpa": 985
+  },
+  {
+    "time": "2026-XX-XXT12:00:00",
+    "lat": 12.1,
+    "lon": 80.1,
+    "wind_kmh": 120,
+    "pressure_hpa": 980
+  }
+]
