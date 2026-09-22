@@ -1,0 +1,7 @@
+streamlit
+folium
+streamlit-folium
+python-dotenv
+requests
+Pillow
+starlette<1.0
