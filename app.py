@@ -11,7 +11,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from dotenv import load_dotenv
 
-from dispatch.email_dispatch import send_email, dispatch_advisory
+from dispatch.email_dispatch import send_email
 from dispatch.mock_inbox import (
     add_to_inbox,
     get_latest
