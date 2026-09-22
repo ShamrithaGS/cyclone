@@ -230,3 +230,79 @@ def test_advisory_endpoint_integration():
     assert "advisory_en" in data
     assert "advisory_ta" in data
     assert data["risk_level"] in ("low", "medium", "high")
+
+
+# ===========================================================================
+# 6. Safety & Data Integrity Regression Tests (Audit Tasks 8 & 10)
+# ===========================================================================
+
+def test_response_contract_no_misleading_legacy_exposure():
+    """Verify legacy_exposure is removed and unavailable data is never represented as 0."""
+    response = client.get("/forecast?cyclone_id=demo")
+    assert response.status_code == 200
+    data = response.json()
+
+    # Must NOT have contradictory legacy_exposure block
+    assert "legacy_exposure" not in data
+
+    # Real infrastructure must clearly report unavailable, not 0
+    exp = data["exposure"]
+    assert exp["substations"]["at_risk"] is None
+    assert exp["substations"]["data_available"] is False
+    assert exp["roads"]["exposed_road_km"] is None
+    assert exp["roads"]["data_available"] is False
+    assert exp["shelters"]["at_risk"] is None
+    assert exp["shelters"]["data_available"] is False
+
+
+def test_surge_risk_is_normalized_score_not_meters():
+    """Verify normalized surge risk score [0,1] is NOT exposed as physical meters."""
+    response = client.get("/forecast?cyclone_id=demo")
+    assert response.status_code == 200
+    data = response.json()
+
+    surge_data = data["hazards"]["surge"]
+    assert "max_surge_score" in surge_data
+    assert 0.0 <= surge_data["max_surge_score"] <= 1.0
+
+    # Physical 'max_surge_m' must NOT be in hazards or exposure
+    assert "max_surge_m" not in surge_data
+    assert "max_surge_m" not in data["exposure"]
+    assert "screening heuristic" in surge_data["model"].lower()
+
+
+def test_cache_invalidation_on_track_change():
+    """Verify cache properly keys on track data and does not return stale results on change."""
+    track_1 = {
+        "cyclone_id": "cache_test",
+        "track_source": "json",
+        "track_points": [
+            {"lat": 13.0, "lon": 80.25, "wind_kmh": 80.0, "pressure_hpa": 995.0}
+        ],
+    }
+    r1 = client.post("/forecast", json=track_1)
+    assert r1.status_code == 200
+    d1 = r1.json()
+    assert d1["cache_hit"] is False
+    assert d1["track_summary"]["max_wind_kmh"] == 80.0
+
+    # Same track again -> cache hit
+    r1_cached = client.post("/forecast", json=track_1)
+    assert r1_cached.status_code == 200
+    assert r1_cached.json()["cache_hit"] is True
+
+    # Different track with higher wind speed -> must NOT hit cache
+    track_2 = {
+        "cyclone_id": "cache_test",
+        "track_source": "json",
+        "track_points": [
+            {"lat": 13.0, "lon": 80.25, "wind_kmh": 165.0, "pressure_hpa": 950.0}
+        ],
+    }
+    r2 = client.post("/forecast", json=track_2)
+    assert r2.status_code == 200
+    d2 = r2.json()
+    assert d2["cache_hit"] is False
+    assert d2["track_summary"]["max_wind_kmh"] == 165.0
+    assert d2["track_summary"]["min_pressure_hpa"] == 950.0
+

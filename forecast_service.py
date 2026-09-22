@@ -241,16 +241,7 @@ def run_forecast_pipeline(request: ForecastRequest) -> dict[str, Any]:
         },
     }
 
-    # 8. Backwards-compatible legacy exposure format for advisory_service
-    legacy_exposure = {
-        "substations_at_risk": sub_exp["at_risk"] if sub_exp["at_risk"] is not None else (2 if request.use_demo_infra else 0),
-        "roads_flooded_km": road_exp["exposed_road_km"] if road_exp["exposed_road_km"] is not None else 0.0,
-        "shelters_at_risk": shelter_exp["at_risk"] if shelter_exp["at_risk"] is not None else 0,
-        "max_surge_m": round(max_surge_val * 1.8, 2),  # proxy mapping for advisory risk classifier
-        "max_wind_kmh": round(max_wind_val, 1),
-    }
-
-    # 9. Build final response
+    # 8. Build final response (strictly availability-aware, no fabricated surge heights or zero exposures)
     elapsed = time.perf_counter() - t_start
     response = {
         "status": "success",
@@ -292,7 +283,6 @@ def run_forecast_pipeline(request: ForecastRequest) -> dict[str, Any]:
             },
         },
         "exposure": exposure_summary,
-        "legacy_exposure": legacy_exposure,
         "validation": {
             "sar_validation": {
                 "status": "BLOCKED",

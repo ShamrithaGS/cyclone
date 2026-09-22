@@ -61,12 +61,28 @@ CACHED_CONFIDENCE_NOTE = "Heuristic model alert: risk levels here are derived fr
 
 
 def compute_risk_level(exposure: dict[str, Any]) -> str:
-    max_surge = float(exposure.get("max_surge_m", 0.0))
+    max_surge_m = exposure.get("max_surge_m")
+    max_surge_score = exposure.get("max_surge_score")
     max_wind = float(exposure.get("max_wind_kmh", 0.0))
-    if max_surge >= 1.5 or max_wind >= 120:
+
+    if max_surge_m is not None:
+        max_surge = float(max_surge_m)
+        if max_surge >= 1.5 or max_wind >= 120:
+            return "high"
+        if max_surge >= 0.8:
+            return "medium"
+        return "low"
+
+    if max_surge_score is not None:
+        score = float(max_surge_score)
+        if score >= 0.8 or max_wind >= 120:
+            return "high"
+        if score >= 0.5:
+            return "medium"
+        return "low"
+
+    if max_wind >= 120:
         return "high"
-    if max_surge >= 0.8:
-        return "medium"
     return "low"
 
 
@@ -351,11 +367,14 @@ def fetch_forecast_payload(cyclone_id: str | None = None) -> dict[str, Any]:
         from forecast_service import get_forecast_by_id
         forecast_result = get_forecast_by_id(cyclone_id or "demo")
         if isinstance(forecast_result, dict):
-            exposure = forecast_result.get("legacy_exposure", forecast_result.get("exposure"))
+            surge_hazards = forecast_result.get("hazards", {}).get("surge", {})
+            track_sum = forecast_result.get("track_summary", {})
             return {
                 "region": "Chennai-Cuddalore coastal stretch",
                 "cyclone_name": cyclone_id or "demo",
-                "exposure": exposure,
+                "max_surge_score": surge_hazards.get("max_surge_score", 0.0),
+                "max_wind_kmh": track_sum.get("max_wind_kmh", 0.0),
+                "exposure": forecast_result.get("exposure", {}),
             }
     except Exception:
         pass
@@ -368,6 +387,11 @@ def fetch_forecast_payload(cyclone_id: str | None = None) -> dict[str, Any]:
 def build_advisory_response(cyclone_id: str = "demo") -> dict[str, Any]:
     forecast = fetch_forecast_payload(cyclone_id)
     exposure = forecast.get("exposure", MOCK_FORECAST["exposure"])
+    risk_info = dict(exposure) if isinstance(exposure, dict) else {}
+    if "max_surge_score" in forecast:
+        risk_info["max_surge_score"] = forecast["max_surge_score"]
+    if "max_wind_kmh" in forecast:
+        risk_info["max_wind_kmh"] = forecast["max_wind_kmh"]
     risk_map = generate_risk_map(seed=7)
     image_dir = Path("tmp") / "risk_maps"
     image_path = render_risk_map_image(risk_map, image_dir / f"{cyclone_id or 'demo'}_risk.png")
@@ -378,5 +402,5 @@ def build_advisory_response(cyclone_id: str = "demo") -> dict[str, Any]:
         "advisory_en": advisory["advisory_en"],
         "advisory_ta": advisory["advisory_ta"],
         "confidence_note": advisory["confidence_note"],
-        "risk_level": compute_risk_level(exposure),
+        "risk_level": compute_risk_level(risk_info),
     }
