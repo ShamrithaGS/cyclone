@@ -1,4 +1,3 @@
-You can replace your README with this:
 
 # Coastal Risk Advisor
 
@@ -78,6 +77,7 @@ Risk-Level Decision
       |
       v
 Municipal Inbox
+
 Key Features
 Cyclone track visualization
 Coastal risk assessment
@@ -90,6 +90,7 @@ Risk-based email dispatch
 Municipal authority inbox
 Mock data and real API modes
 Streamlit-based monitoring dashboard
+
 Risk Assessment Pipeline
 Cyclone Track
       |
@@ -118,6 +119,7 @@ Infrastructure Overlay
       |
       v
 Exposure Analysis
+
 Michaung Backtesting
 Before SAR Image
         |
