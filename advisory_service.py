@@ -347,6 +347,18 @@ def fetch_forecast_payload(cyclone_id: str | None = None) -> dict[str, Any]:
                 return data
         except Exception:
             pass
+    try:
+        from forecast_service import get_forecast_by_id
+        forecast_result = get_forecast_by_id(cyclone_id or "demo")
+        if isinstance(forecast_result, dict):
+            exposure = forecast_result.get("legacy_exposure", forecast_result.get("exposure"))
+            return {
+                "region": "Chennai-Cuddalore coastal stretch",
+                "cyclone_name": cyclone_id or "demo",
+                "exposure": exposure,
+            }
+    except Exception:
+        pass
     mock_copy = json.loads(json.dumps(MOCK_FORECAST))
     if cyclone_id and cyclone_id != "demo":
         mock_copy["cyclone_name"] = cyclone_id
