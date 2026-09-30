@@ -1,242 +1,349 @@
-# Coastal Risk Advisor
+<div align="center">
 
-## Cyclone Impact & Infrastructure Vulnerability Forecaster
+# 🌊 Coastal Risk Advisor
 
-A decision-support system for estimating cyclone-related coastal risk, infrastructure vulnerability, and generating emergency advisories for affected zones.
+### *Cyclone Impact & Infrastructure Vulnerability Forecaster*
+
+**A decision-support platform for turning cyclone data into actionable coastal-risk intelligence.**
+
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](requirements.txt)
+[![Streamlit](https://img.shields.io/badge/dashboard-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![License](https://img.shields.io/badge/license-see%20repository-lightgrey)](#disclaimer)
+
+</div>
 
 ---
 
-## System Overview
+## 🧭 Overview
 
-```text
-Cyclone Track
-     |
-     v
-+-----------------------+
-| Risk & Vulnerability  |
-| Engine                |
-|                       |
-| Wind + DEM + Rainfall |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-| Risk Assessment       |
-| & Infrastructure      |
-| Exposure              |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-| Gemini Advisory       |
-| Generation            |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-| Bilingual Advisory    |
-| English + Tamil       |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-| Dispatch Layer        |
-| Email / Mock Inbox    |
-+-----------+-----------+
-            |
-            v
-   Municipal Authority
-```
+**Coastal Risk Advisor** is an interactive monitoring and decision-support system for estimating cyclone-related coastal risk, identifying exposed infrastructure, validating risk patterns against satellite-derived flood observations, and generating emergency advisories for affected zones.
 
-## Core Workflow
+The platform connects geospatial risk modelling with an operational response workflow:
 
-**Input Data:**
-- Cyclone Track
-- DEM / Elevation
-- Rainfall
-- Infrastructure
-- Sentinel-1 SAR
+> **Cyclone track → risk surface → infrastructure exposure → bilingual advisory → conditional dispatch**
 
-**Processing Pipeline:**
-```
-Risk Prediction
-       |
-       v
-Infrastructure Exposure
-       |
-       v
-AI Advisory Generation
-       |
-       v
-Risk-Level Decision
-       |
-    HIGH?
-    /   \
-  YES    NO
-   |      |
-   v      v
-Dispatch  No Dispatch
-   |
-   v
-Municipal Inbox
-```
+It is designed as a demonstrator for municipal authorities, emergency planners, and data teams who need a clear view of *where risk is concentrated, what may be affected, and what action should follow*.
 
-## Key Features
+> ⚠️ **Important:** This repository contains a heuristic demonstration model. It is not a certified cyclone, storm-surge, flood, landslide, or evacuation forecast.
+
+---
+
+## ✨ Key Features
+
+### 🌪️ Risk Intelligence
 
 - Cyclone track visualization
-- Coastal risk assessment
-- Infrastructure exposure analysis
-- Cyclone Michaung backtesting
-- Sentinel-1 SAR flood comparison
-- AI-assisted advisory generation
-- English and Tamil emergency advisories
-- Risk-based email dispatch
-- Municipal authority inbox
-- Mock data and real API modes
-- Streamlit-based monitoring dashboard
+- Holland wind-model-based wind-risk estimation
+- DEM/elevation-aware coastal risk assessment
+- Rainfall and slope-based flood/landslide risk signals
+- Combined risk-raster generation
 
-## Risk Assessment Pipeline
+### 🏗️ Infrastructure Exposure
 
-```
-Cyclone Track → Holland Wind Model → Wind Risk
-                                   ↓
-DEM / Elevation → Elevation Risk ──┤
-                                   ↓
-Rainfall + Slope → Flood/Landslide Risk
-                                   ↓
-              Risk Raster
-                  |
-                  v
-         Infrastructure Overlay
-         (Substations, Roads, Shelters)
-                  |
-                  v
-         Exposure Analysis
-```
+- Overlay risk surfaces with critical infrastructure
+- Identify potentially exposed substations, roads, and shelters
+- Support rapid prioritization of vulnerable assets
 
-## Michaung Backtesting
+### 🛰️ Satellite Validation
 
-Compares the predicted risk pattern with satellite-derived flood extent from Cyclone Michaung:
+- Cyclone Michaung backtesting workflow
+- Sentinel-1 SAR change detection
+- Comparison of predicted risk patterns with observed flood extent
 
-```
-Before SAR Image → Change Detection → Observed Flood Extent
-                                              ↑
-                                         Comparison
-                                              ↑
-                               Predicted Risk Raster
-                                    (from Risk Model)
-```
+### 🧠 AI-Assisted Response
 
-## Advisory and Dispatch Flow
+- Gemini-powered emergency advisory generation
+- English and Tamil advisory output
+- Risk-aware response language for affected zones
 
-```
-Risk Assessment
-       |
-       v
-Advisory Generation
-       |
-       v
-Risk Level
-       |
-    +---------+
-    |         |
-  HIGH    NOT HIGH
-    |         |
-    v         v
-Email     No Dispatch
-Dispatch
-    |
-    v
-Municipal Inbox
+### 📬 Dispatch & Operations
+
+- Conditional email dispatch for high-risk scenarios
+- Municipal authority inbox for demonstration workflows
+- Local mock-inbox fallback when external email delivery is unavailable
+- Mock-data and live-API operating modes
+
+### 🖥️ Interactive Dashboard
+
+- Streamlit-based monitoring interface
+- Folium interactive maps
+- End-to-end demonstration flow from track to dispatch
+
+---
+
+## 🏗️ System Architecture
+
+```mermaid
+flowchart TD
+    A["Cyclone Track"] --> B["Risk & Vulnerability Engine"]
+    C["DEM / Elevation"] --> B
+    D["Rainfall + Slope"] --> B
+    B --> E["Combined Risk Raster"]
+
+    E --> F["Infrastructure Overlay"]
+    F --> G["Exposure Analysis"]
+
+    G --> H["AI Advisory Generation"]
+    H --> I["English + Tamil Advisory"]
+    I --> J{"Risk Level HIGH?"}
+
+    J -->|Yes| K["Email Dispatch"]
+    J -->|No| L["No Dispatch"]
+    K --> M["Municipal Authority Inbox"]
+
+    N["Sentinel-1 SAR"] --> O["Backtesting & Change Detection"]
+    E --> O
+    O --> P["Predicted vs Observed Flood Extent"]
 ```
 
-**Note:** External dispatch failures are handled using a local demonstration fallback.
+### Component roles
 
-## Technology Stack
+| Component | Technology / Location | Role |
+|---|---|---|
+| Dashboard | `app.py` / Streamlit | Interactive monitoring and decision-support interface |
+| Maps | Folium | Cyclone track, risk, and infrastructure visualization |
+| Risk engine | Python, NumPy, Pandas | Wind, elevation, rainfall, slope, and combined-risk processing |
+| API layer | FastAPI | Backend service for advisory and application integrations |
+| Advisory layer | Gemini | AI-assisted emergency message generation |
+| Validation | Sentinel-1 SAR | Satellite-based flood/change comparison |
+| Dispatch | `dispatch/` | SMTP delivery and local mock-inbox fallback |
+| Mock inputs | `mock/` | Reproducible demonstration data and advisory examples |
 
-| Component | Technology |
-|-----------|-----------|
-| Frontend | Streamlit |
-| Interactive Map | Folium |
-| Backend APIs | FastAPI |
-| Machine Learning | Python |
-| AI Advisory | Gemini |
-| Satellite Validation | Sentinel-1 SAR |
-| Data Processing | NumPy, Pandas, Raster Processing |
-| Communication | SMTP Email |
-| Version Control | Git / GitHub |
+---
 
-## Project Structure
+## 🔄 Core Workflow
 
+```text
+┌──────────────────────┐
+│  Cyclone Track Data  │
+└──────────┬───────────┘
+           v
+┌──────────────────────┐     ┌──────────────────────┐
+│ Holland Wind Model   │     │ DEM / Rainfall /Slope│
+│ Wind-Risk Surface    │     │ Flood & Elevation    │
+└──────────┬───────────┘     └──────────┬───────────┘
+           └──────────────┬─────────────┘
+                          v
+                 ┌────────────────┐
+                 │ Combined Risk  │
+                 │ Raster         │
+                 └───────┬────────┘
+                         v
+                 ┌────────────────┐
+                 │ Infrastructure │
+                 │ Exposure       │
+                 └───────┬────────┘
+                         v
+                 ┌────────────────┐
+                 │ Advisory       │
+                 │ Generation     │
+                 └───────┬────────┘
+                         v
+                    ┌───────────┐
+                    │ HIGH RISK?│
+                    └─────┬─────┘
+                    Yes    │    No
+                     v     │     v
+              ┌──────────┐  │  ┌────��───────┐
+              │ Dispatch│  │  │ No Dispatch│
+              └────┬─────┘  │  └────────────┘
+                   v        │
+          ┌────────────────┐ │
+          │ Municipal     │ │
+          │ Inbox         │ │
+          └────────────────┘
 ```
-coastal-risk-advisor/
-|
-├── app.py
-|
+
+---
+
+## 🛰️ Michaung Backtesting
+
+The backtesting workflow compares modelled risk with satellite-derived flood observations from Cyclone Michaung:
+
+```text
+Before SAR Image
+        │
+        v
+Change Detection
+        │
+        v
+Observed Flood Extent
+        ▲
+        │ comparison
+        │
+Predicted Risk Raster
+(from the risk model)
+```
+
+This provides a visual validation layer for the demonstration model and helps communicate where modelled exposure agrees with, or differs from, observed flood change.
+
+---
+
+## 📁 Project Structure
+
+```text
+cyclone/
+├── app.py                         # Streamlit dashboard entry point
 ├── dispatch/
 │   ├── __init__.py
-│   ├── email_dispatch.py
-│   └── mock_inbox.py
-|
+│   ├── email_dispatch.py          # SMTP dispatch integration
+│   └── mock_inbox.py              # Local demonstration inbox
 ├── mock/
-│   ├── advisory.json
-│   └── track.geojson
-|
+��   ├── advisory.json              # Example advisory data
+│   └── track.geojson              # Example cyclone track
 ├── assets/
-│   ├── risk_map.png
-│   └── backtest_comparison.png
-|
-├── requirements.txt
-├── test_email.py
-└── .gitignore
+│   ├── risk_map.png               # Risk visualisation asset
+│   └── backtest_comparison.png    # Michaung comparison asset
+├── requirements.txt               # Python dependencies
+├── test_email.py                  # Email/dispatch checks
+├── render.yaml                    # Render deployment blueprint
+└── README.md
 ```
 
-## Running the Application
+---
 
-1. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+## 🚀 Getting Started
 
-2. **Configure environment variables** in `.env`
+### Prerequisites
 
-3. **Run the Streamlit application:**
-   ```bash
-   streamlit run app.py
-   ```
+- Python 3.10+
+- `pip`
+- Optional: Gemini API credentials for live advisory generation
+- Optional: SMTP credentials for email dispatch
 
-## Deployment on Render
+### Installation
 
-The `render.yaml` Blueprint defines separate FastAPI and Streamlit web services.
+```bash
+git clone https://github.com/ShamrithaGS/cyclone.git
+cd cyclone
 
-1. Push this repository to GitHub
-2. In Render, choose **New + → Blueprint**
-3. Select this repository and apply
+python -m venv venv
+source venv/bin/activate       # Windows: venv\\Scripts\\activate
 
-**Environment Variables:**
-- Set `GEMINI_API_KEY` on the API service if live Gemini advisory generation is enabled
-- Set `EMAIL_ADDRESS`, `EMAIL_APP_PASSWORD`, and `TEST_EMAIL` on the dashboard service if email dispatch is enabled
-
-## Demo Flow
-
-```
-1. Launch Dashboard
-       ↓
-2. View Cyclone Track
-       ↓
-3. Review Risk Assessment
-       ↓
-4. Review Infrastructure Exposure
-       ↓
-5. View Michaung Backtest
-       ↓
-6. Generate Advisory
-       ↓
-7. Check Risk Level (HIGH?)
-       ↓
-8. If HIGH → Dispatch Email → Municipal Authority Inbox
+pip install -r requirements.txt
 ```
 
-## Disclaimer
+### Run the dashboard
 
-The current risk assessment uses a heuristic demonstration model and is **not a certified cyclone, storm-surge, flood, or evacuation forecast**.
+```bash
+streamlit run app.py
+```
+
+Then open the local Streamlit URL shown in your terminal.
+
+### Run the available checks
+
+```bash
+python test_email.py
+```
+
+---
+
+## 🔐 Configuration
+
+Create a `.env` file or configure environment variables in your deployment platform.
+
+| Variable | Used by | Purpose |
+|---|---|---|
+| `GEMINI_API_KEY` | API / advisory layer | Enables live Gemini advisory generation |
+| `EMAIL_ADDRESS` | Dashboard / dispatch | Sender email address |
+| `EMAIL_APP_PASSWORD` | Dashboard / dispatch | SMTP app password |
+| `TEST_EMAIL` | Dashboard / dispatch | Destination address for demonstration dispatch |
+
+If live credentials are not configured, the application can use mock data and the local demonstration inbox for safe testing.
+
+> 🔒 Never commit API keys, SMTP passwords, or other secrets to the repository.
+
+---
+
+## ☁️ Deployment on Render
+
+The included `render.yaml` blueprint defines separate FastAPI and Streamlit web services.
+
+1. Push the repository to GitHub.
+2. In Render, select **New + → Blueprint**.
+3. Connect `ShamrithaGS/cyclone`.
+4. Apply the blueprint.
+5. Add the required environment variables to the relevant services.
+
+For a dashboard-only deployment, configure the service to start the Streamlit application with:
+
+```bash
+streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+```
+
+---
+
+## 🎬 Demo Flow
+
+```text
+1. Launch the dashboard
+          ↓
+2. View the cyclone track
+          ↓
+3. Review the coastal risk assessment
+          ↓
+4. Inspect infrastructure exposure
+          ↓
+5. Compare the Michaung backtest
+          ↓
+6. Generate an English/Tamil advisory
+          ↓
+7. Check the calculated risk level
+          ↓
+8. If HIGH → dispatch email
+          ↓
+9. Review the municipal authority inbox
+```
+
+---
+
+## 🧰 Technology Stack
+
+| Area | Technology |
+|---|---|
+| Language | Python |
+| Dashboard | Streamlit |
+| Interactive maps | Folium |
+| Backend APIs | FastAPI |
+| Numerical processing | NumPy, Pandas |
+| Risk modelling | Holland wind model, DEM, rainfall, slope signals |
+| AI advisory | Gemini |
+| Satellite validation | Sentinel-1 SAR |
+| Communication | SMTP email |
+| Deployment | Render |
+| Version control | Git / GitHub |
+
+---
+
+## 🎯 Intended Use
+
+This project is intended for:
+
+- Emergency-management demonstrations
+- Coastal-risk analysis prototypes
+- Infrastructure vulnerability exploration
+- Geospatial and satellite-validation workflows
+- Bilingual public-safety communication experiments
+- Hackathon and research presentations
+
+It is **not** intended to replace official meteorological warnings, disaster-management authorities, evacuation orders, or certified engineering assessments.
+
+---
+
+## ⚠️ Disclaimer
+
+The current risk assessment uses a heuristic demonstration model and is **not a certified cyclone, storm-surge, flood, landslide, infrastructure, or evacuation forecast**. Results should not be used as the sole basis for public-safety decisions. Always defer to official warnings and qualified emergency-management professionals.
+
+External dispatch failures are handled through a local demonstration fallback so that the application remains usable during development and presentations.
+
+---
+
+<div align="center">
+
+### 🌊 Turning hazard data into decisions — responsibly.
+
+**Built for coastal resilience, infrastructure awareness, and faster emergency communication.**
+
+</div>
