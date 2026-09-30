@@ -1,0 +1,41 @@
+{
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {
+                "time": "2026-09-21T06:00:00",
+                "wind_kmh": 110,
+                "pressure_hpa": 980
+            },
+            "geometry": {
+                "type": "Point",
+                "coordinates": [80.30, 13.20]
+            }
+        },
+        {
+            "type": "Feature",
+            "properties": {
+                "time": "2026-09-21T12:00:00",
+                "wind_kmh": 125,
+                "pressure_hpa": 975
+            },
+            "geometry": {
+                "type": "Point",
+                "coordinates": [80.15, 13.10]
+            }
+        },
+        {
+            "type": "Feature",
+            "properties": {
+                "time": "2026-09-21T18:00:00",
+                "wind_kmh": 135,
+                "pressure_hpa": 970
+            },
+            "geometry": {
+                "type": "Point",
+                "coordinates": [80.05, 13.00]
+            }
+        }
+    ]
+}

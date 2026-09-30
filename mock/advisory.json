@@ -1,0 +1,10 @@
+{
+    "zones": [
+        "North of Chennai Port",
+        "NH-45 near Cuddalore"
+    ],
+    "advisory_en": "Evacuate coastal zones near Chennai Port before 06:00 IST tomorrow. Avoid flooded roads and follow municipal instructions.",
+    "advisory_ta": "நாளை காலை 6 மணிக்குள் சென்னை துறைமுகம் அருகிலுள்ள கடலோர பகுதிகளை காலி செய்யவும். வெள்ளம் சூழ்ந்த சாலைகளை தவிர்த்து மாநகராட்சி அறிவுறுத்தல்களை பின்பற்றவும்.",
+    "confidence_note": "This is a heuristic model, not a certified forecast.",
+    "risk_level": "high"
+}

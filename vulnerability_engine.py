@@ -1,0 +1,1022 @@
+"""
+vulnerability_engine.py
+=======================
+Flood / cyclone vulnerability analysis for the Chennai-Cuddalore domain.
+
+Raster inputs (all on DIFFERENT grids -- MUST align to DEM before mixing):
+  dem.tif          6681x2228  ~30 m   EPSG:4326   int16   nodata=-32768
+  rainfall.tif      201x  68  ~1000m  EPSG:4326   float64
+  sar_before.tif   2005x 669  ~100m   EPSG:4326   float64 (VV, dB)
+
+Vector inputs (0 features each -- OSM fetch failed upstream):
+  substations.geojson   hospitals.geojson   roads.geojson
+
+Thresholds (from task spec -- do NOT change without explicit approval):
+  Rainfall heavy:  > 200 mm
+  Slope landslide: > 15 degrees
+  SAR change:      > 2.5 dB
+  Surge exposure:  elevation <= 1 m AND within surge-risk distance
+
+Heuristics note:
+  surge_risk_from_track() and slope_landslide_risk() are distance/slope
+  heuristics -- explicitly NOT SLOSH-grade storm-surge or physics-based
+  landslide models.
+
+DATA LIMITATION -- rainfall.tif:
+  The rainfall raster values range from ~143 mm to ~803 mm (mean ~484 mm).
+  The accumulation period is NOT confirmed to be 24 hours.  The dataset is
+  likely a multi-day event total.  Do NOT describe outputs as "200 mm/24h"
+  flood risk unless dataset metadata explicitly confirms the 24-hour period.
+  The 200 mm threshold is locked per task spec; only the interpretation of
+  the risk extent is affected by this ambiguity.
+
+Wind-speed normalization note (Stage 2):
+  surge_risk_from_track() produces a [0,1] normalized risk score.  The raw
+  proxy uses wind_kmh to scale absolute wind-stress contributions so that
+  stronger track points dominate weaker ones within the same track.  However,
+  because the field is globally normalized to [0,1], uniform wind speed
+  changes across all track points still partially cancel.  Do NOT describe
+  the output as a calibrated absolute surge height.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import warnings
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib
+matplotlib.use("Agg")                     # headless-safe backend
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import rasterio  # type: ignore
+from rasterio.enums import Resampling  # type: ignore
+from scipy.ndimage import gaussian_filter
+from shapely.geometry import Point
+
+warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("vuln_engine")
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+_HERE = Path(__file__).parent
+
+DEM_PATH         = _HERE / "dem.tif"
+RAINFALL_PATH    = _HERE / "rainfall.tif"
+SAR_BEFORE_PATH  = _HERE / "sar_before.tif"
+SUBSTATIONS_PATH = _HERE / "substations.geojson"
+HOSPITALS_PATH   = _HERE / "hospitals.geojson"
+ROADS_PATH       = _HERE / "roads.geojson"
+TRACK_CSV_PATH   = _HERE / "michaung_track.csv"
+TRACK_JSON_PATH  = _HERE / "test_2026_track.json"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_dem() -> tuple[np.ndarray, rasterio.transform.Affine, rasterio.crs.CRS]:
+    """Load DEM, mask nodata, return (array_float32, transform, crs)."""
+    with rasterio.open(DEM_PATH) as src:
+        dem = src.read(1).astype(np.float32)
+        nodata = src.nodata if src.nodata is not None else -32768
+        dem[dem == nodata] = np.nan
+        return dem, src.transform, src.crs
+
+
+
+def load_track(source):
+    """Load a cyclone track from a CSV file or a JSON file/list.
+
+    Parameters
+    ----------
+    source : str | Path | list
+        - Path ending in .csv  -> read with pd.read_csv().
+          Expected columns: lat, lon (time/wind_kmh/pressure_hpa optional).
+        - Path ending in .json -> read with json.load(); must be a list of
+          dicts each containing at least 'lat' and 'lon'.
+        - list of dicts        -> converted directly to DataFrame.
+
+    Returns
+    -------
+    pd.DataFrame with at minimum columns ['lat', 'lon'].
+    Optional columns retained if present: time, wind_kmh, pressure_hpa.
+    """
+    OPTIONAL_COLS = ["time", "wind_kmh", "pressure_hpa"]
+
+    if isinstance(source, list):
+        df = pd.DataFrame(source)
+        log.info("load_track: loaded %d points from in-memory list", len(df))
+    else:
+        source = Path(source)
+        if source.suffix.lower() == ".csv":
+            df = pd.read_csv(source)
+            log.info("load_track: loaded %d points from CSV  [%s]", len(df), source.name)
+        elif source.suffix.lower() == ".json":
+            with open(source, encoding="utf-8") as fh:
+                records = json.load(fh)
+            df = pd.DataFrame(records)
+            log.info("load_track: loaded %d points from JSON [%s]", len(df), source.name)
+        else:
+            raise ValueError(f"load_track: unsupported file extension '{source.suffix}'")
+
+    if "lat" not in df.columns or "lon" not in df.columns:
+        raise ValueError("load_track: DataFrame must contain 'lat' and 'lon' columns")
+
+    keep = ["lat", "lon"] + [c for c in OPTIONAL_COLS if c in df.columns]
+    return df[keep].copy()
+
+
+def align_to_reference(
+    src_path,
+    ref_transform,
+    ref_crs,
+    ref_shape,
+    resampling=Resampling.bilinear,
+):
+    """Reproject and resample src_path onto the DEM reference grid.
+
+    Every function that mixes rasters MUST call this first -- the three input
+    rasters live on different grids and cannot be indexed against each other
+    directly.
+
+    Returns a float32 array of shape ref_shape with NaN where no valid data.
+    """
+    import rasterio.warp  # type: ignore
+
+    src_path = Path(src_path)
+    with rasterio.open(src_path) as src:
+        out = np.full(ref_shape, np.nan, dtype=np.float32)
+        rasterio.warp.reproject(
+            source=rasterio.band(src, 1),
+            destination=out,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=ref_transform,
+            dst_crs=ref_crs,
+            resampling=resampling,
+            src_nodata=src.nodata,
+            dst_nodata=np.nan,
+        )
+    log.debug("align_to_reference: %s -> shape %s", src_path.name, ref_shape)
+    return out
+
+
+def lonlat_to_rowcol(lon, lat, transform, height, width):
+    """Convert lon/lat to integer (row, col) on the given raster grid.
+
+    Uses the raster affine transform:
+      col = (lon - transform.c) / transform.a
+      row = (lat - transform.f) / transform.e   (e is negative -> north-up)
+
+    Returns (None, None) if the point falls outside the raster extent.
+    """
+    col = (lon - transform.c) / transform.a
+    row = (lat - transform.f) / transform.e
+    row_i, col_i = int(row), int(col)
+    if 0 <= row_i < height and 0 <= col_i < width:
+        return row_i, col_i
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Step 1 -- Rainfall flood risk
+# ---------------------------------------------------------------------------
+
+def rainfall_flood_risk(dem, ref_transform=None, ref_crs=None, threshold_mm=200.0):
+    """Binary mask: pixels where aligned rainfall exceeds threshold_mm.
+
+    Rainfall is resampled to the DEM grid via align_to_reference() before
+    thresholding so the arrays are spatially registered.
+
+    Threshold: 200 mm (from task spec -- do not change without approval).
+    Returns float32 array (1.0 = high flood risk, 0.0 = low, NaN = nodata).
+
+    DATA LIMITATION: rainfall.tif accumulation period is NOT confirmed to be
+    24 hours.  The raster likely represents a multi-day event total, which
+    causes the majority (~97%) of the domain to exceed the 200 mm threshold.
+    Do not describe this output as '200 mm/24h rainfall risk' without
+    confirming the dataset metadata.
+    """
+    if isinstance(ref_transform, (int, float)):
+        threshold_mm = float(ref_transform)
+        ref_transform = None
+        ref_crs = None
+    if ref_transform is None or ref_crs is None:
+        _, ref_transform, ref_crs = _load_dem()
+    dem_h, dem_w = dem.shape
+    rain_aligned = align_to_reference(
+        RAINFALL_PATH, ref_transform, ref_crs, (dem_h, dem_w), Resampling.bilinear
+    )
+    mask = np.where(
+        np.isnan(dem) | np.isnan(rain_aligned),
+        np.nan,
+        (rain_aligned > threshold_mm).astype(np.float32),
+    )
+    n_high  = int(np.nansum(mask))
+    n_total = int(np.sum(~np.isnan(mask)))
+    log.info(
+        "Rainfall flood risk (>%.0f mm): %d / %d pixels  (%.1f%%)",
+        threshold_mm, n_high, n_total, 100 * n_high / max(n_total, 1),
+    )
+    return mask
+
+
+# ---------------------------------------------------------------------------
+# Step 2 -- Slope / landslide risk (heuristic, not physics-based)
+# ---------------------------------------------------------------------------
+
+def slope_landslide_risk(dem, transform, threshold_deg=15.0):
+    """Binary mask: pixels where terrain slope exceeds threshold_deg.
+
+    NOTE: This is a slope-threshold heuristic -- explicitly NOT a physics-based
+    landslide model.  Treat outputs as a first-order screening layer only.
+
+    Threshold: 15 degrees (from task spec -- do not change without approval).
+    Returns float32 array (1.0 = landslide-prone, 0.0 = low risk, NaN = nodata).
+    """
+    lat_center = transform.f + transform.e * dem.shape[0] / 2
+    deg_to_m_lon = 111_320 * np.cos(np.radians(lat_center))
+    deg_to_m_lat = 111_320
+    dx_m = abs(transform.a) * deg_to_m_lon
+    dy_m = abs(transform.e) * deg_to_m_lat
+
+    gy, gx = np.gradient(dem, dy_m, dx_m)
+    slope_deg = np.degrees(np.arctan(np.sqrt(gx**2 + gy**2)))
+
+    mask = np.where(
+        np.isnan(dem),
+        np.nan,
+        (slope_deg > threshold_deg).astype(np.float32),
+    )
+    n_high  = int(np.nansum(mask))
+    n_total = int(np.sum(~np.isnan(mask)))
+    log.info(
+        "Slope landslide risk (>%.0f deg): %d / %d pixels  (%.1f%%)",
+        threshold_deg, n_high, n_total, 100 * n_high / max(n_total, 1),
+    )
+    return mask
+
+
+# ---------------------------------------------------------------------------
+# Step 3 -- Combined Rainfall and Slope risk (Stage 3 Integration)
+# ---------------------------------------------------------------------------
+
+def rainfall_slope_combined_risk(rain_mask, slope_mask):
+    """Binary mask: pixels where BOTH rainfall and slope thresholds are met.
+
+    Expected inputs are float32 arrays (1.0=risk, 0.0=no risk, NaN=nodata)
+    that have already been aligned to the DEM reference grid.
+
+    Returns float32 array (1.0 = combined risk, 0.0 = no combined risk, NaN = nodata).
+    """
+    # Using np.where to properly handle NaNs: if either input is NaN, output is NaN.
+    # Otherwise, it's 1.0 if both are 1.0, and 0.0 otherwise.
+    combined = np.where(
+        np.isnan(rain_mask) | np.isnan(slope_mask),
+        np.nan,
+        ((rain_mask > 0.5) & (slope_mask > 0.5)).astype(np.float32)
+    )
+
+    n_high = int(np.nansum(combined))
+    n_total = int(np.sum(~np.isnan(combined)))
+    log.info(
+        "Combined Rainfall+Slope risk: %d / %d pixels  (%.1f%%)",
+        n_high, n_total, 100 * n_high / max(n_total, 1)
+    )
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Step 4 -- Surge risk from cyclone track (heuristic, not SLOSH-grade)
+# ---------------------------------------------------------------------------
+
+def surge_risk_from_track(
+    dem,
+    transform,
+    track_df,
+    surge_elev_threshold_m=1.0,
+    decay_km=50.0,
+    use_holland=True,
+):
+    """Heuristic storm-surge risk on the DEM grid.
+
+    Algorithm (use_holland=True -- DEFAULT)
+    ----------------------------------------
+    For each track point:
+      1. Compute Rmax (radius of maximum wind) from pressure_hpa + lat via the
+         Willoughby & Darling (2004) empirical fit.
+      2. Compute Holland B shape factor from pressure_hpa.
+      3. Build the Holland (1980) radial wind profile V(r) for every DEM pixel
+         using haversine distance r_km from the track point.
+      4. Compute per-pixel surge proxy = (V / Vmax)^2  (wind-stress proportional).
+    Take the maximum surge proxy across all track points.
+    Then apply coastal/elevation mask and Gaussian smoothing (same as before).
+
+    Fallback (use_holland=False)
+    ----------------------------
+    Original exponential distance-decay: exp(-dist_km / decay_km).
+    Available for backward compatibility / comparison.
+
+    NOTE: This remains an empirical HEURISTIC -- explicitly NOT a SLOSH-grade
+    storm-surge model and NOT a physical surge height prediction.  Treat as a
+    first-order screening layer only.
+
+    Holland formulas used
+    ---------------------
+    B       = clip(1.5 + (950 - p_hpa) / 120, 1.0, 2.5)
+    Rmax_km = clip(exp(3.015 - 6.291e-5*(1010-p)^2 + 0.0169*lat), 10, 200)
+    V(r)    = Vmax * (Rmax/r)^B * exp(1 - (Rmax/r)^B)
+    proxy   = (V/Vmax)^2
+
+    Defaults when columns are absent
+    ---------------------------------
+    wind_kmh     -> 120 km/h   (Category-2-equivalent; logged as WARNING)
+    pressure_hpa -> 980 hPa    (moderate cyclone;       logged as WARNING)
+
+    Parameters
+    ----------
+    dem                  : float32 DEM array on reference grid
+    transform            : rasterio Affine transform of DEM
+    track_df             : DataFrame with lat, lon; optionally wind_kmh, pressure_hpa
+    surge_elev_threshold_m : coastal exposure elevation limit (1 m, task spec)
+    decay_km             : e-folding distance for fallback distance-decay mode
+    use_holland          : if True (default), use Holland wind-field proxy;
+                           if False, fall back to original exp(-d/decay_km)
+
+    Returns
+    -------
+    float32 array [0, 1] on DEM grid.  NaN where DEM is masked.
+    """
+    import time as _time
+    _t0 = _time.perf_counter()
+
+    H, W = dem.shape
+    N    = len(track_df)
+
+    # ------------------------------------------------------------------
+    # Extract track arrays (float32 for memory efficiency)
+    # ------------------------------------------------------------------
+    tlat  = track_df["lat"].values.astype(np.float32)
+    tlon  = track_df["lon"].values.astype(np.float32)
+    tlat_r = np.radians(tlat)
+    tlon_r = np.radians(tlon)
+
+    # Intensity columns -- fall back to documented defaults if absent
+    _WIND_DEFAULT = np.float32(120.0)     # km/h
+    _PRES_DEFAULT = np.float32(980.0)     # hPa
+
+    if "wind_kmh" in track_df.columns:
+        twind = track_df["wind_kmh"].fillna(float(_WIND_DEFAULT)).values.astype(np.float32)
+    else:
+        log.warning(
+            "surge_risk_from_track: 'wind_kmh' column missing -- "
+            "using default %.0f km/h for all %d track points.", _WIND_DEFAULT, N
+        )
+        twind = np.full(N, _WIND_DEFAULT, dtype=np.float32)
+
+    if "pressure_hpa" in track_df.columns:
+        tpres = track_df["pressure_hpa"].fillna(float(_PRES_DEFAULT)).values.astype(np.float32)
+    else:
+        log.warning(
+            "surge_risk_from_track: 'pressure_hpa' column missing -- "
+            "using default %.0f hPa for all %d track points.", _PRES_DEFAULT, N
+        )
+        tpres = np.full(N, _PRES_DEFAULT, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Pre-compute Holland parameters per track point  (N,)
+    # ------------------------------------------------------------------
+    if use_holland:
+        # Holland B: dimensionless shape factor [1.0, 2.5]
+        holland_B = np.clip(
+            np.float32(1.5) + (np.float32(950.0) - tpres) / np.float32(120.0),
+            np.float32(1.0), np.float32(2.5)
+        )                                                           # (N,)
+
+        # Rmax: Willoughby & Darling (2004) empirical fit, clipped [10, 200] km
+        rmax_km = np.clip(
+            np.exp(
+                np.float32(3.015)
+                - np.float32(6.291e-5) * (np.float32(1010.0) - tpres) ** 2
+                + np.float32(0.0169)  * tlat
+            ),
+            np.float32(10.0), np.float32(200.0)
+        )                                                           # (N,)
+
+        # Vmax in m/s -- used in proxy so wind speed participates in raw score
+        vmax_ms = twind / np.float32(3.6)                          # (N,)
+
+        log.info(
+            "Holland params: B=%.2f-%.2f  Rmax=%.0f-%.0f km  Vmax=%.0f-%.0f m/s",
+            holland_B.min(), holland_B.max(),
+            rmax_km.min(), rmax_km.max(),
+            vmax_ms.min(), vmax_ms.max(),
+        )
+
+    # ------------------------------------------------------------------
+    # Pixel coordinate arrays on DEM grid
+    # ------------------------------------------------------------------
+    lons_f32 = (transform.c + (np.arange(W) + 0.5) * transform.a).astype(np.float32)
+    lats_f32 = (transform.f + (np.arange(H) + 0.5) * transform.e).astype(np.float32)
+    R_km = np.float32(6371.0)
+
+    # ------------------------------------------------------------------
+    # Chunked computation over DEM rows to stay within ~200 MB peak RAM.
+    # Chunk shape: (CHUNK_ROWS, W, N) float32
+    # At CHUNK_ROWS=64: 64 * 2228 * N * 4 bytes; safe for N up to ~100.
+    # ------------------------------------------------------------------
+    CHUNK_ROWS  = 64
+    surge_score = np.zeros((H, W), dtype=np.float32)
+
+    for row_start in range(0, H, CHUNK_ROWS):
+        row_end     = min(row_start + CHUNK_ROWS, H)
+        chunk_lats  = lats_f32[row_start:row_end]                  # (chunk,)
+
+        # Haversine distance (chunk, W, N)
+        lat_r = np.radians(chunk_lats[:, None, None])              # (chunk, 1, 1)
+        lon_r = np.radians(lons_f32[None, :, None])                # (1, W, 1)
+
+        dlat = tlat_r[None, None, :] - lat_r
+        dlon = tlon_r[None, None, :] - lon_r
+
+        a_h = (
+            np.sin(dlat / 2) ** 2
+            + np.cos(lat_r) * np.cos(tlat_r[None, None, :]) * np.sin(dlon / 2) ** 2
+        )
+        r_km = 2 * R_km * np.arcsin(
+            np.sqrt(np.clip(a_h, np.float32(0), np.float32(1)))
+        )                                                           # (chunk, W, N)
+
+        if use_holland:
+            # Clip r to ≥ 1 km to avoid divide-by-zero at track center pixel
+            r_km_safe = np.maximum(r_km, np.float32(1.0))
+
+            # Holland ratio x = Rmax / r  (N,) broadcast -> (chunk, W, N)
+            x = rmax_km[None, None, :] / r_km_safe                 # (chunk, W, N)
+
+            # Holland wind profile: V/Vmax = x^B * exp(1 - x^B)
+            xB         = x ** holland_B[None, None, :]             # (chunk, W, N)
+            v_over_max = xB * np.exp(np.float32(1.0) - xB)        # (chunk, W, N)
+
+            # Surge proxy = (V/Vmax * Vmax)^2 = (V)^2 ~ wind stress.
+            # Multiplying by vmax_ms ensures that a stronger track point
+            # (higher wind speed) contributes a larger raw proxy than a
+            # weaker one at the same radial distance and pressure, so
+            # wind_kmh genuinely participates in relative spatial risk.
+            # NOTE: the output is still globally normalized to [0,1], so
+            # absolute values do not represent calibrated surge heights.
+            proxy = (v_over_max * vmax_ms[None, None, :]) ** 2    # (chunk, W, N)
+
+            # Maximum proxy across all track points -> (chunk, W)
+            surge_score[row_start:row_end, :] = proxy.max(axis=2)
+
+        else:
+            # Fallback: original distance-decay
+            min_dist = r_km.min(axis=2)                            # (chunk, W)
+            surge_score[row_start:row_end, :] = np.exp(-min_dist / decay_km)
+
+    # ------------------------------------------------------------------
+    # Coastal mask: only DEM <= surge_elev_threshold_m qualifies.
+    # The DEM elevation mask is the sole coastal constraint here --
+    # no external coastline shapefile is needed or used.
+    # ------------------------------------------------------------------
+    coastal_mask = (dem <= surge_elev_threshold_m) & (~np.isnan(dem))
+    surge_score[~coastal_mask] = np.float32(0.0)
+    surge_score[np.isnan(dem)] = np.nan
+
+    # Normalize to [0, 1] (Holland proxy peaks at ~0.368 at r=Rmax, so rescale)
+    valid    = ~np.isnan(surge_score)
+    max_val  = float(np.nanmax(surge_score))
+    if max_val > 0:
+        surge_score = np.where(valid, surge_score / max_val, np.nan).astype(np.float32)
+
+    # Gaussian smooth (same sigma as before)
+    tmp = np.where(valid, surge_score, np.float32(0.0))
+    tmp = gaussian_filter(tmp, sigma=3).astype(np.float32)
+    # Mask to coastal pixels so smoothing does not leak into inland elevation > threshold
+    surge_score = np.where(coastal_mask, tmp, np.float32(0.0)).astype(np.float32)
+
+    # Re-normalize after smoothing
+    max_val2 = float(np.nanmax(surge_score))
+    if max_val2 > 0:
+        surge_score = np.where(valid, surge_score / max_val2, np.nan).astype(np.float32)
+    surge_score[~coastal_mask] = np.float32(0.0)
+    surge_score[np.isnan(dem)] = np.nan
+
+    n_high    = int(np.nansum(surge_score > 0.5))
+    n_coastal = int(np.nansum(coastal_mask))
+    elapsed   = _time.perf_counter() - _t0
+    mode_str  = "Holland wind-field" if use_holland else "distance-decay fallback"
+    log.info(
+        "Surge risk [%s]: %d coastal pixels (<=%.0fm);  %d pixels score>0.5  "
+        "(%.1f s)",
+        mode_str, n_coastal, surge_elev_threshold_m, n_high, elapsed,
+    )
+    return surge_score
+
+
+# ---------------------------------------------------------------------------
+# Step 4 -- Infrastructure exposure (graceful on empty GeoDataFrames)
+# ---------------------------------------------------------------------------
+
+def summarize_point_exposure(
+    risk_array,
+    transform,
+    crs,
+    gdf,
+    layer_name,
+    risk_threshold=0.5,
+):
+    """Count point features from gdf that overlap high-risk pixels in risk_array.
+
+    Degrades gracefully when gdf has 0 features: returns a result dict with
+    {layer_name}_data_available: False and exposed=None, without crashing.
+    """
+    result = {
+        "layer": layer_name,
+        "total_features": len(gdf),
+        "at_risk": None,
+        "percentage_exposed": None,
+        f"{layer_name}_data_available": len(gdf) > 0,
+    }
+
+    if len(gdf) == 0:
+        log.warning(
+            "summarize_point_exposure: '%s' GeoDataFrame is empty -- returning None exposure "
+            "(upstream OSM fetch failed; out of scope for this engine).",
+            layer_name,
+        )
+        return result
+
+    if gdf.crs and gdf.crs != crs:
+        gdf = gdf.to_crs(crs)
+
+    H, W = risk_array.shape
+    at_risk = 0
+    for geom in gdf.geometry:
+        if geom is None:
+            continue
+        pt = geom.centroid if geom.geom_type != "Point" else geom
+        r, c = lonlat_to_rowcol(pt.x, pt.y, transform, H, W)
+        if r is None:
+            continue
+        val = risk_array[r, c]
+        if not np.isnan(val) and val > risk_threshold:
+            at_risk += 1
+
+    result["at_risk"] = at_risk
+    if len(gdf) > 0:
+        result["percentage_exposed"] = (at_risk / len(gdf)) * 100
+
+    log.info(
+        "Exposure '%s': %d / %d features at risk (threshold %.2f)",
+        layer_name, at_risk, len(gdf), risk_threshold,
+    )
+    return result
+
+
+def summarize_road_exposure(
+    risk_array,
+    transform,
+    crs,
+    gdf,
+    layer_name,
+    risk_threshold=0.5,
+):
+    """Calculate exposed road length in km.
+
+    Reprojects roads to UTM Zone 44N (EPSG:32644) for metric length calculation.
+    Degrades gracefully when gdf has 0 features.
+    """
+    result = {
+        "layer": layer_name,
+        "total_features": len(gdf),
+        "total_road_km": 0.0,
+        "exposed_road_km": None,
+        "percentage_exposed": None,
+        f"{layer_name}_data_available": len(gdf) > 0,
+    }
+
+    if len(gdf) == 0:
+        log.warning(
+            "summarize_road_exposure: '%s' GeoDataFrame is empty -- returning None exposure.",
+            layer_name,
+        )
+        return result
+
+    # Reproject to metric CRS for length calculation (UTM Zone 44N for Chennai area)
+    utm_crs = "EPSG:32644"
+    if gdf.crs != utm_crs:
+        gdf_metric = gdf.to_crs(utm_crs)
+    else:
+        gdf_metric = gdf
+
+    if gdf.crs and gdf.crs != crs:
+        gdf_grid = gdf.to_crs(crs)
+    else:
+        gdf_grid = gdf
+
+    total_km = gdf_metric.geometry.length.sum() / 1000.0
+    result["total_road_km"] = total_km
+
+    H, W = risk_array.shape
+    exposed_km = 0.0
+
+    for geom_grid, geom_metric in zip(gdf_grid.geometry, gdf_metric.geometry):
+        if geom_grid is None or geom_metric is None:
+            continue
+        # Use centroid of each line segment for simple pixel intersection
+        pt = geom_grid.centroid
+        r, c = lonlat_to_rowcol(pt.x, pt.y, transform, H, W)
+        if r is None:
+            continue
+        val = risk_array[r, c]
+        if not np.isnan(val) and val > risk_threshold:
+            exposed_km += geom_metric.length / 1000.0
+
+    result["exposed_road_km"] = exposed_km
+    if total_km > 0:
+        result["percentage_exposed"] = (exposed_km / total_km) * 100
+
+    log.info(
+        "Exposure '%s': %.2f / %.2f km at risk (threshold %.2f)",
+        layer_name, exposed_km, total_km, risk_threshold,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Step 5 -- SAR change detection (stub -- no after-scene yet)
+# ---------------------------------------------------------------------------
+
+def sar_change_detection(
+    before_path,
+    after_path,
+    dem,
+    ref_transform,
+    ref_crs,
+    threshold_db=2.5,
+):
+    """Detect flood inundation from SAR backscatter change.
+
+    Both images are aligned to the DEM grid before differencing.
+    Threshold: 2.5 dB (from task spec -- do not change without approval).
+
+    Returns float32 binary mask (1.0 = significant decrease -> likely flooded).
+    NOTE: Wire this function when a real SAR after-scene is available.
+    """
+    H, W = dem.shape
+    before_aligned = align_to_reference(before_path, ref_transform, ref_crs, (H, W))
+    after_aligned  = align_to_reference(after_path,  ref_transform, ref_crs, (H, W))
+
+    change = before_aligned - after_aligned
+    flooded = ((change > threshold_db) & (~np.isnan(dem))).astype(np.float32)
+    flooded[np.isnan(before_aligned) | np.isnan(after_aligned)] = np.nan
+
+    n_flooded = int(np.nansum(flooded))
+    log.info(
+        "SAR change detection (>%.1f dB decrease): %d pixels flagged as flooded",
+        threshold_db, n_flooded,
+    )
+    return flooded
+
+
+def compare_with_model(sar_flooded, model_risk, label="flood"):
+    """Compare SAR-derived flood extent with model risk layer.
+
+    Both arrays must be on the same grid (DEM reference).
+    Returns a dict with pixel-level agreement statistics.
+    """
+    valid     = ~(np.isnan(sar_flooded) | np.isnan(model_risk))
+    sar_bin   = sar_flooded[valid] > 0.5
+    model_bin = model_risk[valid]  > 0.5
+
+    tp = int(np.sum( sar_bin &  model_bin))
+    fp = int(np.sum(~sar_bin &  model_bin))
+    fn = int(np.sum( sar_bin & ~model_bin))
+    tn = int(np.sum(~sar_bin & ~model_bin))
+
+    precision = tp / max(tp + fp, 1)
+    recall    = tp / max(tp + fn, 1)
+    f1        = 2 * precision * recall / max(precision + recall, 1e-9)
+    accuracy  = (tp + tn) / max(tp + fp + fn + tn, 1)
+
+    result = {
+        "label": label,
+        "true_positive": tp, "false_positive": fp,
+        "false_negative": fn, "true_negative": tn,
+        "precision": round(precision, 3),
+        "recall":    round(recall, 3),
+        "f1":        round(f1, 3),
+        "accuracy":  round(accuracy, 3),
+    }
+    log.info(
+        "compare_with_model '%s': P=%.3f  R=%.3f  F1=%.3f  Acc=%.3f",
+        label, precision, recall, f1, accuracy,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Demo helpers
+# ---------------------------------------------------------------------------
+
+def demo_fallback_infrastructure():
+    """Return synthetic infrastructure GeoDataFrames for pipeline demos ONLY.
+
+    *** DEMO FALLBACK -- not OSM ***
+    These locations are fabricated and MUST NOT be used in any real analysis,
+    report, or decision-support output.  They exist solely so the pipeline
+    can be demonstrated end-to-end when the upstream OSM fetch has failed.
+    """
+    log.warning("demo_fallback_infrastructure: *** DEMO FALLBACK -- not OSM ***")
+    crs = "EPSG:4326"
+    substations = gpd.GeoDataFrame(
+        {"name": ["Sub-Demo-A", "Sub-Demo-B", "Sub-Demo-C"]},
+        geometry=[Point(80.27, 13.08), Point(80.12, 12.40), Point(80.22, 11.92)],
+        crs=crs,
+    )
+    hospitals = gpd.GeoDataFrame(
+        {"name": ["Hosp-Demo-A", "Hosp-Demo-B"]},
+        geometry=[Point(80.23, 13.05), Point(80.18, 12.35)],
+        crs=crs,
+    )
+    roads = gpd.GeoDataFrame(
+        {"name": ["Road-Demo-A"]},
+        geometry=[Point(80.20, 12.80)],
+        crs=crs,
+    )
+    return {"substations": substations, "hospitals": hospitals, "roads": roads}
+
+
+def demo_backtest(dem, transform, crs, surge_risk, rain_risk,
+                  out_path="backtest_demo.png"):
+    """Produce a clearly-labeled SYNTHETIC backtest comparison figure.
+
+    There is NO real SAR after-scene for Michaung.  This function creates a
+    plausible synthetic flood mask from existing model layers SOLELY to
+    exercise the compare_with_model() code path.  The figure is watermarked
+    and all returned metrics carry a synthetic: True flag.
+
+    *** Do NOT interpret these numbers as a real validation result. ***
+    When a real after-scene is available, call sar_change_detection() and
+    compare_with_model() directly and remove the synthetic labeling.
+    """
+    log.warning(
+        "demo_backtest: generating SYNTHETIC comparison -- NO real SAR after-scene "
+        "for Michaung.  Metrics are code-path test only."
+    )
+
+    synthetic_flooded = np.where(
+        np.isnan(surge_risk) | np.isnan(rain_risk),
+        np.nan,
+        ((surge_risk > 0.3) & (rain_risk > 0.5)).astype(np.float32),
+    )
+
+    combined_risk = np.where(
+        np.isnan(dem), np.nan,
+        (np.nan_to_num(surge_risk) + np.nan_to_num(rain_risk)) / 2.0,
+    ).astype(np.float32)
+
+    stats = compare_with_model(synthetic_flooded, combined_risk, label="surge+rain")
+    stats["synthetic"] = True
+    stats["warning"] = (
+        "SYNTHETIC backtest -- no real SAR after-scene for Michaung. "
+        "Metrics are code-path test only."
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=110)
+    fig.patch.set_facecolor("#111111")
+
+    def _imshow(ax, arr, title, cmap="RdYlGn_r", vmin=0, vmax=1):
+        ax.set_facecolor("#111111")
+        im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax,
+                       origin="upper", interpolation="nearest")
+        ax.set_title(title, color="white", fontsize=10, pad=6)
+        ax.tick_params(colors="white")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#444")
+        cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cb.ax.yaxis.set_tick_params(color="white")
+        plt.setp(cb.ax.yaxis.get_ticklabels(), color="white")
+        return im
+
+    _imshow(axes[0], np.nan_to_num(surge_risk),       "Surge Risk Score [0-1]")
+    _imshow(axes[1], np.nan_to_num(rain_risk),         "Rainfall Flood Risk [0/1]")
+    _imshow(axes[2], np.nan_to_num(synthetic_flooded),
+            "SYNTHETIC Flooded Pixels\n(code-path test only)")
+
+    for ax in axes:
+        ax.text(0.5, 0.01, "SYNTHETIC -- NOT REAL DATA",
+                transform=ax.transAxes, ha="center", va="bottom",
+                fontsize=8, color="yellow", alpha=0.7)
+
+    metrics_txt = (
+        f"Synthetic F1={stats['f1']:.3f}  P={stats['precision']:.3f}  "
+        f"R={stats['recall']:.3f}  Acc={stats['accuracy']:.3f}\n"
+        "SYNTHETIC BACKTEST -- code-path validation only (no real SAR after-scene)"
+    )
+    fig.suptitle(metrics_txt, color="yellow", fontsize=9, y=0.02)
+    plt.tight_layout(rect=[0, 0.06, 1, 1])
+    fig.savefig(out_path, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    log.info("demo_backtest: figure saved to %s", out_path)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def main():
+    log.info("=== Vulnerability Engine starting ===")
+
+    # Load DEM (reference grid)
+    log.info("Loading DEM ...")
+    dem, ref_transform, ref_crs = _load_dem()
+    H, W = dem.shape
+    with rasterio.open(DEM_PATH) as _src:
+        log.info("DEM: %d x %d pixels | bounds %s", H, W, _src.bounds)
+
+    # Step 1: Rainfall flood risk
+    log.info("--- Step 1: Rainfall flood risk ---")
+    rain_risk = rainfall_flood_risk(dem, ref_transform, ref_crs)
+
+    # Step 2: Slope landslide risk
+    log.info("--- Step 2: Slope landslide risk ---")
+    slope_risk = slope_landslide_risk(dem, ref_transform)
+
+    # Step 3: Combined Rainfall + Slope risk
+    log.info("--- Step 3: Combined Rainfall + Slope risk ---")
+    combined_risk = rainfall_slope_combined_risk(rain_risk, slope_risk)
+
+    # Step 4: Surge risk
+    # PRIMARY showcase track: test_2026_track.json (lon 80.1-80.5, inside DEM bbox)
+    # Historical validation:  michaung_track.csv  (lon 80.2-86.4, closest ~140 km east)
+    log.info("--- Step 4: Surge risk from track ---")
+
+    log.info("Track source: %s", TRACK_JSON_PATH.name)
+    demo_track_df = load_track(TRACK_JSON_PATH)
+    log.info(
+        "Track points: %d | lat %.1f-%.1f | lon %.1f-%.1f",
+        len(demo_track_df),
+        demo_track_df.lat.min(), demo_track_df.lat.max(),
+        demo_track_df.lon.min(), demo_track_df.lon.max(),
+    )
+    surge_risk = surge_risk_from_track(dem, ref_transform, demo_track_df)
+    surge_high = int(np.nansum(surge_risk > 0.5))
+    surge_max  = float(np.nanmax(surge_risk))
+    log.info("Surge max score: %.4f | pixels > 0.5: %d", surge_max, surge_high)
+
+    # Historical track (kept for reference — does NOT drive the figures)
+    log.info("Historical track source: %s (validation reference only)", TRACK_CSV_PATH.name)
+    hist_track_df = load_track(TRACK_CSV_PATH)
+    log.info(
+        "Historical track: %d points | lat %.1f-%.1f | lon %.1f-%.1f"
+        " (closest approach ~140 km east of DEM bbox; score>0.5 = 0 at decay_km=50)",
+        len(hist_track_df),
+        hist_track_df.lat.min(), hist_track_df.lat.max(),
+        hist_track_df.lon.min(), hist_track_df.lon.max(),
+    )
+
+    # Step 5: Infrastructure exposure (substations, hospitals, shelters, roads)
+    log.info("--- Step 5: Infrastructure exposure ---")
+    substations_gdf = gpd.read_file(SUBSTATIONS_PATH) if SUBSTATIONS_PATH.exists() else gpd.GeoDataFrame()
+    hospitals_gdf   = gpd.read_file(HOSPITALS_PATH) if HOSPITALS_PATH.exists() else gpd.GeoDataFrame()
+    roads_gdf       = gpd.read_file(ROADS_PATH) if ROADS_PATH.exists() else gpd.GeoDataFrame()
+
+    SHELTERS_PATH = _HERE / "shelters.geojson"
+    if SHELTERS_PATH.exists():
+        shelters_gdf = gpd.read_file(SHELTERS_PATH)
+    else:
+        shelters_gdf = gpd.GeoDataFrame() # Empty gdf triggers data_available=False
+
+    exp_substations = summarize_point_exposure(
+        surge_risk, ref_transform, ref_crs, substations_gdf, "substations"
+    )
+    exp_hospitals = summarize_point_exposure(
+        surge_risk, ref_transform, ref_crs, hospitals_gdf, "hospitals"
+    )
+    exp_shelters = summarize_point_exposure(
+        surge_risk, ref_transform, ref_crs, shelters_gdf, "shelters"
+    )
+    exp_roads = summarize_road_exposure(
+        rain_risk, ref_transform, ref_crs, roads_gdf, "roads"
+    )
+
+    # Step 5b: Demo fallback (DEMO FALLBACK -- not OSM data)
+    log.info("--- Step 5b: Demo fallback infrastructure (DEMO FALLBACK -- not OSM) ---")
+    demo_infra = demo_fallback_infrastructure()
+    exp_sub_demo  = summarize_point_exposure(
+        surge_risk, ref_transform, ref_crs,
+        demo_infra["substations"], "substations_demo"
+    )
+    exp_hosp_demo = summarize_point_exposure(
+        surge_risk, ref_transform, ref_crs,
+        demo_infra["hospitals"], "hospitals_demo"
+    )
+    exp_road_demo = summarize_road_exposure(
+        rain_risk, ref_transform, ref_crs,
+        demo_infra["roads"], "roads_demo"
+    )
+
+    # Step 6: SAR -- before-scene only (real backtest blocked: no sar_after.tif)
+    log.info(
+        "--- Step 6: SAR -- only before-scene available; "
+        "real sar_change_detection() BLOCKED (sar_after.tif missing) ---"
+    )
+    log.info(
+        "SAR before: %s loaded (~100m resolution). "
+        "No after-scene -- sar_change_detection() will be wired when available.",
+        SAR_BEFORE_PATH.name,
+    )
+
+    # Step 7: Demo backtest (SYNTHETIC code-path test only -- NOT real validation)
+    log.info("--- Step 7: Demo backtest (SYNTHETIC -- NOT REAL DATA) ---")
+    backtest_stats = demo_backtest(
+        dem, ref_transform, ref_crs,
+        surge_risk, rain_risk,
+        out_path="backtest_demo.png",
+    )
+
+    # Summary
+    print()
+    print("=" * 60)
+    print("  VULNERABILITY ENGINE SUMMARY")
+    print("=" * 60)
+    print()
+    rain_high   = int(np.nansum(rain_risk  > 0.5))
+    rain_total  = int(np.sum(~np.isnan(rain_risk)))
+    slope_high  = int(np.nansum(slope_risk > 0.5))
+    slope_total = int(np.sum(~np.isnan(slope_risk)))
+    combined_high = int(np.nansum(combined_risk > 0.5))
+    combined_total = int(np.sum(~np.isnan(combined_risk)))
+    surge_total = int(np.sum(~np.isnan(surge_risk)))
+    coastal_px  = int(np.nansum((dem <= 1.0) & ~np.isnan(dem)))
+
+    print(f"[Rainfall]  High-risk pixels (>200 mm):   {rain_high:>10,} / {rain_total:,}  "
+          f"({100*rain_high/max(rain_total,1):.1f}%)")
+    print(f"[Landslide] High-risk pixels (>15 deg):   {slope_high:>10,} / {slope_total:,}  "
+          f"({100*slope_high/max(slope_total,1):.1f}%)")
+    print(f"[Combined]  Rainfall + Slope risk:        {combined_high:>10,} / {combined_total:,}  "
+          f"({100*combined_high/max(combined_total,1):.1f}%)")
+    print(f"[Surge]     Track source:                 {TRACK_JSON_PATH.name}")
+    print(f"[Surge]     Max score:                        {surge_max:.4f}")
+    print(f"[Surge]     Coastal pixels (<=1m DEM):    {coastal_px:>10,}")
+    print(f"[Surge]     High-risk pixels (score>0.5): {surge_high:>10,} / {surge_total:,}  "
+          f"({100*surge_high/max(surge_total,1):.1f}%)")
+    print()
+    print("Infrastructure exposure (real OSM / datasets):")
+    print(f"  Substations at surge risk: {exp_substations['at_risk']} / "
+          f"{exp_substations['total_features']}  "
+          f"(data_available={exp_substations['substations_data_available']})")
+    print(f"  Hospitals   at surge risk: {exp_hospitals['at_risk']} / "
+          f"{exp_hospitals['total_features']}  "
+          f"(data_available={exp_hospitals['hospitals_data_available']})")
+    print(f"  Shelters    at surge risk: {exp_shelters['at_risk']} / "
+          f"{exp_shelters['total_features']}  "
+          f"(data_available={exp_shelters['shelters_data_available']})")
+
+    roads_exp_km = exp_roads['exposed_road_km']
+    roads_tot_km = exp_roads['total_road_km']
+    print(f"  Roads       at rain  risk: {f'{roads_exp_km:.2f}' if roads_exp_km is not None else 'None'} / "
+          f"{roads_tot_km:.2f} km  "
+          f"(data_available={exp_roads['roads_data_available']})")
+    print()
+    print("Infrastructure exposure (DEMO FALLBACK -- not OSM):")
+    print(f"  Substations at surge risk: {exp_sub_demo['at_risk']} / "
+          f"{exp_sub_demo['total_features']}")
+    print(f"  Hospitals   at surge risk: {exp_hosp_demo['at_risk']} / "
+          f"{exp_hosp_demo['total_features']}")
+
+    roads_demo_exp = exp_road_demo['exposed_road_km']
+    roads_demo_tot = exp_road_demo['total_road_km']
+    print(f"  Roads       at rain  risk: {f'{roads_demo_exp:.2f}' if roads_demo_exp is not None else 'None'} / "
+          f"{roads_demo_tot:.2f} km")
+    print()
+    print("SYNTHETIC Backtest (code-path test only -- no real SAR after-scene):")
+    print(f"  F1={backtest_stats['f1']:.3f}  "
+          f"Precision={backtest_stats['precision']:.3f}  "
+          f"Recall={backtest_stats['recall']:.3f}  "
+          f"Accuracy={backtest_stats['accuracy']:.3f}")
+    print(f"  WARNING: {backtest_stats['warning']}")
+    print()
+    print("Output: backtest_demo.png written")
+    print("=" * 60)
+
+    log.info("=== Vulnerability Engine complete ===")
+
+
+if __name__ == "__main__":
+    main()

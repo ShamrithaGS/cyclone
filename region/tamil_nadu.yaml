@@ -1,0 +1,11 @@
+name: tamil_nadu
+display_name: "Tamil Nadu — Chennai to Cuddalore"
+bbox: [79.8, 11.5, 80.4, 13.3]
+languages: [en, ta]
+data_dir: data/tamil_nadu
+infra_sources:
+  hospitals: tn_ogd
+  substations: manual_tangedco
+  roads: static_osm_export
+dispatch_contacts_path: configs/contacts/tamil_nadu.yaml
+historical_storms: [michaung_2023, vardah_2016, gaja_2018, nivar_2020]
